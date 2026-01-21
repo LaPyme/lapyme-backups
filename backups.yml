@@ -1,0 +1,60 @@
+  name: Database Backup                                      
+                                                             
+  on:                                                        
+    schedule:                                                
+      - cron: '0 * * * *'  # Every hour                      
+    workflow_dispatch:      # Manual trigger for testing     
+                                                             
+  jobs:                                                      
+    backup:                                                  
+      runs-on: ubuntu-latest                                 
+      steps:                                                 
+        - name: Create backup                                
+          env:                                               
+            DATABASE_URL: ${{ secrets.DATABASE_URL }}        
+          run: |                                             
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)                 
+            pg_dump "$DATABASE_URL" --format=custom          
+  --compress=9 > "backup_${TIMESTAMP}.dump"                  
+            echo "BACKUP_FILE=backup_${TIMESTAMP}.dump" >>   
+  $GITHUB_ENV                                                
+                                                             
+        - name: Upload to R2                                 
+          env:                                               
+            AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID  
+  }}                                                         
+            AWS_SECRET_ACCESS_KEY: ${{                       
+  secrets.R2_SECRET_ACCESS_KEY }}                            
+            R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}          
+            R2_BUCKET: ${{ secrets.R2_BUCKET }}              
+          run: |                                             
+            aws s3 cp "$BACKUP_FILE"                         
+  "s3://${R2_BUCKET}/hourly/$BACKUP_FILE" \                  
+              --endpoint-url "$R2_ENDPOINT"                  
+                                                             
+        - name: Cleanup old backups                          
+          env:                                               
+            AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID  
+  }}                                                         
+            AWS_SECRET_ACCESS_KEY: ${{                       
+  secrets.R2_SECRET_ACCESS_KEY }}                            
+            R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}          
+            R2_BUCKET: ${{ secrets.R2_BUCKET }}              
+          run: |                                             
+            # Delete hourly backups older than 24 hours      
+            aws s3 ls "s3://${R2_BUCKET}/hourly/"            
+  --endpoint-url "$R2_ENDPOINT" | while read -r line; do     
+              FILE=$(echo "$line" | awk '{print $4}')        
+              FILE_DATE=$(echo "$FILE" | grep -oP '\d{8}' |  
+  head -1)                                                   
+              if [[ -n "$FILE_DATE" ]]; then                 
+                FILE_TS=$(date -d "$FILE_DATE" +%s           
+  2>/dev/null || echo "0")                                   
+                CUTOFF=$(date -d '24 hours ago' +%s)         
+                if [[ "$FILE_TS" -lt "$CUTOFF" && "$FILE_TS" 
+  -ne "0" ]]; then                                           
+                  aws s3 rm "s3://${R2_BUCKET}/hourly/$FILE" 
+  --endpoint-url "$R2_ENDPOINT"                              
+                fi                                           
+              fi                                             
+            done                                             
