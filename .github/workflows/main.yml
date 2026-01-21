@@ -20,9 +20,8 @@
             DATABASE_URL: ${{ secrets.DATABASE_URL }}                                                                                             
           run: |                                                                                                                                  
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)                                                                                                      
-            pg_dump "$DATABASE_URL" --format=custom --compress=9 > "backup_${TIMESTAMP}.dump"                                                     
-            echo "BACKUP_FILE=backup_${TIMESTAMP}.dump" >> $GITHUB_ENV                                                                            
-                                                                                                                                                  
+            /usr/lib/postgresql/17/bin/pg_dump "$DATABASE_URL" --format=custom --compress=9 > "backup_${TIMESTAMP}.dump"                          
+            echo "BACKUP_FILE=backup_${TIMESTAMP}.dump" >> $GITHUB_ENV                                                                                                                                                                                                                              
         - name: Upload to R2                                                                                                                      
           env:                                                                                                                                    
             AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}                                                                                    
