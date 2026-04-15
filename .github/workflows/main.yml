@@ -2,51 +2,140 @@ name: Database Backup
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: "0 */4 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-backup
+  cancel-in-progress: false
+
+env:
+  BACKUP_PREFIX: db/4h
+  RETAIN_COUNT: "42"
 
 jobs:
   backup:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
-      - name: Install PostgreSQL 17 client
-        run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-17
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Create backup
+      - name: Validate backup configuration
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          /usr/lib/postgresql/17/bin/pg_dump "$DATABASE_URL" --format=custom --compress=9 > "backup_${TIMESTAMP}.dump"
-          echo "BACKUP_FILE=backup_${TIMESTAMP}.dump" >> $GITHUB_ENV
-
-      - name: Upload to R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: aws s3 cp "$BACKUP_FILE" "s3://${R2_BUCKET}/hourly/$BACKUP_FILE" --endpoint-url "$R2_ENDPOINT"
-
-      - name: Cleanup old backups
-        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          aws s3 ls "s3://${R2_BUCKET}/hourly/" --endpoint-url "$R2_ENDPOINT" | while read -r line; do
-            FILE=$(echo "$line" | awk '{print $4}')
-            FILE_DATE=$(echo "$FILE" | grep -oP '\d{8}' | head -1)
-            if [[ -n "$FILE_DATE" ]]; then
-              FILE_TS=$(date -d "$FILE_DATE" +%s 2>/dev/null || echo "0")
-              CUTOFF=$(date -d '24 hours ago' +%s)
-              if [[ "$FILE_TS" -lt "$CUTOFF" && "$FILE_TS" -ne "0" ]]; then
-                aws s3 rm "s3://${R2_BUCKET}/hourly/$FILE" --endpoint-url "$R2_ENDPOINT"
-              fi
+          set -euo pipefail
+
+          for var in \
+            BACKUP_DATABASE_URL \
+            AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY \
+            R2_ENDPOINT \
+            R2_BUCKET
+          do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Missing required secret: $var"
+              exit 1
             fi
+          done
+
+      - name: Create and validate logical backup
+        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+
+          TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          BACKUP_FILE="backup_${TIMESTAMP}.dump"
+          CHECKSUM_FILE="${BACKUP_FILE}.sha256"
+
+          docker run --rm \
+            -e BACKUP_DATABASE_URL \
+            -e BACKUP_FILE \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            postgres:17 \
+            sh -ceu '
+              pg_dump \
+                --dbname "$BACKUP_DATABASE_URL" \
+                --format=custom \
+                --compress=9 \
+                --file "$BACKUP_FILE"
+
+              # Fail here if the custom dump is unreadable or empty/corrupt.
+              pg_restore --list "$BACKUP_FILE" >/dev/null
+            '
+
+          sha256sum "$BACKUP_FILE" > "$CHECKSUM_FILE"
+
+          echo "BACKUP_FILE=$BACKUP_FILE" >> "$GITHUB_ENV"
+          echo "CHECKSUM_FILE=$CHECKSUM_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload backup artifacts to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          aws s3 cp \
+            "$BACKUP_FILE" \
+            "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${BACKUP_FILE}" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --only-show-errors
+
+          aws s3 cp \
+            "$CHECKSUM_FILE" \
+            "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${CHECKSUM_FILE}" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --only-show-errors
+
+      - name: Retain only the newest backups
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t DUMP_KEYS < <(
+            aws s3 ls "s3://${R2_BUCKET}/${BACKUP_PREFIX}/" \
+              --endpoint-url "$R2_ENDPOINT" |
+              awk '{print $4}' |
+              grep -E '\.dump$' |
+              sort
+          )
+
+          TOTAL_BACKUPS="${#DUMP_KEYS[@]}"
+
+          if [ "$TOTAL_BACKUPS" -le "$RETAIN_COUNT" ]; then
+            echo "No retention cleanup needed. Found ${TOTAL_BACKUPS} dump files."
+            exit 0
+          fi
+
+          DELETE_COUNT=$((TOTAL_BACKUPS - RETAIN_COUNT))
+
+          for ((i = 0; i < DELETE_COUNT; i++)); do
+            KEY="${DUMP_KEYS[$i]}"
+            aws s3 rm \
+              "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${KEY}" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --only-show-errors
+
+            aws s3 rm \
+              "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${KEY}.sha256" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --only-show-errors || true
           done
