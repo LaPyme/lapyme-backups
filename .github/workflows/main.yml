@@ -69,6 +69,7 @@ jobs:
                 --dbname "$BACKUP_DATABASE_URL" \
                 --format=custom \
                 --compress=9 \
+                --exclude-table-data=public.iibb_padron_rates \
                 --file "$BACKUP_FILE"
 
               # Fail here if the custom dump is unreadable or empty/corrupt.
