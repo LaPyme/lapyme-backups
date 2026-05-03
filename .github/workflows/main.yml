@@ -60,7 +60,7 @@ jobs:
 
           docker run --rm \
             -e BACKUP_DATABASE_URL \
-            -e BACKUP_FILE \
+            -e BACKUP_FILE="$BACKUP_FILE" \
             -v "$PWD:/workspace" \
             -w /workspace \
             postgres:17 \
