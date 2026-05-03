@@ -78,6 +78,14 @@ jobs:
 
           sha256sum "$BACKUP_FILE" > "$CHECKSUM_FILE"
 
+          ls -lh "$BACKUP_FILE" "$CHECKSUM_FILE"
+          echo "Dump archive entries: $(docker run --rm \
+            -e BACKUP_FILE="$BACKUP_FILE" \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            postgres:17 \
+            sh -ceu 'pg_restore --list "$BACKUP_FILE" | wc -l')"
+
           echo "BACKUP_FILE=$BACKUP_FILE" >> "$GITHUB_ENV"
           echo "CHECKSUM_FILE=$CHECKSUM_FILE" >> "$GITHUB_ENV"
 
