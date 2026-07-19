@@ -2,7 +2,8 @@ name: Database Backup
 
 on:
   schedule:
-    - cron: "0 */4 * * *"
+    # 03:00 Argentina (UTC-3), once per day.
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,18 +14,20 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BACKUP_PREFIX: db/4h
-  RETAIN_COUNT: "42"
+  DAILY_BACKUP_PREFIX: db/daily
+  MONTHLY_BACKUP_PREFIX: db/monthly
+  DAILY_RETAIN_COUNT: "35"
+  MONTHLY_RETAIN_COUNT: "12"
+  # Pin the multi-platform manifest behind postgres:17. Update deliberately.
+  POSTGRES_IMAGE: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
 
 jobs:
   backup:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+    environment: production-backups
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Validate backup configuration
         env:
           BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
@@ -48,6 +51,19 @@ jobs:
             fi
           done
 
+          # GitHub masks complete secrets. Mask derived URL fields too so a
+          # connection error cannot reveal the production host or username.
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+
+          for variable in ("BACKUP_DATABASE_URL", "R2_ENDPOINT"):
+              parsed = urlsplit(os.environ[variable])
+              for value in (parsed.hostname, parsed.username):
+                  if value:
+                      print(f"::add-mask::{value}")
+          PY
+
       - name: Create and validate logical backup
         env:
           BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
@@ -57,13 +73,14 @@ jobs:
           TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
           BACKUP_FILE="backup_${TIMESTAMP}.dump"
           CHECKSUM_FILE="${BACKUP_FILE}.sha256"
+          ERROR_LOG="${RUNNER_TEMP}/pg-dump.stderr"
 
-          docker run --rm \
+          if ! docker run --rm \
             -e BACKUP_DATABASE_URL \
             -e BACKUP_FILE="$BACKUP_FILE" \
             -v "$PWD:/workspace" \
             -w /workspace \
-            postgres:17 \
+            "$POSTGRES_IMAGE" \
             sh -ceu '
               pg_dump \
                 --dbname "$BACKUP_DATABASE_URL" \
@@ -74,22 +91,19 @@ jobs:
 
               # Fail here if the custom dump is unreadable or empty/corrupt.
               pg_restore --list "$BACKUP_FILE" >/dev/null
-            '
+            ' 2>"$ERROR_LOG"
+          then
+            echo "::error::Database backup failed; details were suppressed to keep the public workflow log private."
+            exit 1
+          fi
 
           sha256sum "$BACKUP_FILE" > "$CHECKSUM_FILE"
-
-          ls -lh "$BACKUP_FILE" "$CHECKSUM_FILE"
-          echo "Dump archive entries: $(docker run --rm \
-            -e BACKUP_FILE="$BACKUP_FILE" \
-            -v "$PWD:/workspace" \
-            -w /workspace \
-            postgres:17 \
-            sh -ceu 'pg_restore --list "$BACKUP_FILE" | wc -l')"
+          echo "Database archive creation and local validation succeeded."
 
           echo "BACKUP_FILE=$BACKUP_FILE" >> "$GITHUB_ENV"
           echo "CHECKSUM_FILE=$CHECKSUM_FILE" >> "$GITHUB_ENV"
 
-      - name: Upload backup artifacts to R2
+      - name: Upload daily and monthly backup artifacts to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -98,53 +112,94 @@ jobs:
         run: |
           set -euo pipefail
 
-          aws s3 cp \
-            "$BACKUP_FILE" \
-            "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${BACKUP_FILE}" \
-            --endpoint-url "$R2_ENDPOINT" \
-            --only-show-errors
+          upload_artifacts() {
+            local prefix="$1"
 
-          aws s3 cp \
-            "$CHECKSUM_FILE" \
-            "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${CHECKSUM_FILE}" \
-            --endpoint-url "$R2_ENDPOINT" \
-            --only-show-errors
-
-      - name: Retain only the newest backups
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: |
-          set -euo pipefail
-
-          mapfile -t DUMP_KEYS < <(
-            aws s3 ls "s3://${R2_BUCKET}/${BACKUP_PREFIX}/" \
-              --endpoint-url "$R2_ENDPOINT" |
-              awk '{print $4}' |
-              grep -E '\.dump$' |
-              sort
-          )
-
-          TOTAL_BACKUPS="${#DUMP_KEYS[@]}"
-
-          if [ "$TOTAL_BACKUPS" -le "$RETAIN_COUNT" ]; then
-            echo "No retention cleanup needed. Found ${TOTAL_BACKUPS} dump files."
-            exit 0
-          fi
-
-          DELETE_COUNT=$((TOTAL_BACKUPS - RETAIN_COUNT))
-
-          for ((i = 0; i < DELETE_COUNT; i++)); do
-            KEY="${DUMP_KEYS[$i]}"
-            aws s3 rm \
-              "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${KEY}" \
+            aws s3 cp \
+              "$BACKUP_FILE" \
+              "s3://${R2_BUCKET}/${prefix}/${BACKUP_FILE}" \
               --endpoint-url "$R2_ENDPOINT" \
               --only-show-errors
 
-            aws s3 rm \
-              "s3://${R2_BUCKET}/${BACKUP_PREFIX}/${KEY}.sha256" \
+            aws s3 cp \
+              "$CHECKSUM_FILE" \
+              "s3://${R2_BUCKET}/${prefix}/${CHECKSUM_FILE}" \
               --endpoint-url "$R2_ENDPOINT" \
-              --only-show-errors || true
-          done
+              --only-show-errors
+          }
+
+          upload_artifacts "$DAILY_BACKUP_PREFIX"
+
+          # Preserve the first successful backup in each UTC month. Checking
+          # every day tolerates a delayed, failed, or partially uploaded run.
+          CURRENT_MONTH="$(date -u +%Y%m)"
+          if ! aws s3 ls \
+            "s3://${R2_BUCKET}/${MONTHLY_BACKUP_PREFIX}/" \
+            --endpoint-url "$R2_ENDPOINT" |
+            awk -v month="$CURRENT_MONTH" '
+              $4 ~ ("^backup_" month "[0-9]{2}T[0-9]{6}Z\\.dump$") {
+                dumps[$4] = 1
+              }
+              $4 ~ ("^backup_" month "[0-9]{2}T[0-9]{6}Z\\.dump\\.sha256$") {
+                checksums[substr($4, 1, length($4) - 7)] = 1
+              }
+              END {
+                for (dump in dumps) {
+                  if (checksums[dump]) {
+                    exit 0
+                  }
+                }
+                exit 1
+              }
+            '
+          then
+            upload_artifacts "$MONTHLY_BACKUP_PREFIX"
+          fi
+
+      - name: Apply database backup retention
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          retain_newest() {
+            local prefix="$1"
+            local retain_count="$2"
+            local -a dump_keys
+
+            mapfile -t dump_keys < <(
+              aws s3 ls "s3://${R2_BUCKET}/${prefix}/" \
+                --endpoint-url "$R2_ENDPOINT" |
+                awk '$4 ~ /\.dump$/ {print $4}' |
+                sort
+            )
+
+            local total_backups="${#dump_keys[@]}"
+            if [ "$total_backups" -le "$retain_count" ]; then
+              echo "Retention is satisfied for ${prefix}."
+              return
+            fi
+
+            local delete_count=$((total_backups - retain_count))
+            local key
+            for ((i = 0; i < delete_count; i++)); do
+              key="${dump_keys[$i]}"
+              aws s3 rm \
+                "s3://${R2_BUCKET}/${prefix}/${key}" \
+                --endpoint-url "$R2_ENDPOINT" \
+                --only-show-errors
+
+              aws s3 rm \
+                "s3://${R2_BUCKET}/${prefix}/${key}.sha256" \
+                --endpoint-url "$R2_ENDPOINT" \
+                --only-show-errors || true
+            done
+
+            echo "Expired backup retention was applied to ${prefix}."
+          }
+
+          retain_newest "$DAILY_BACKUP_PREFIX" "$DAILY_RETAIN_COUNT"
+          retain_newest "$MONTHLY_BACKUP_PREFIX" "$MONTHLY_RETAIN_COUNT"
