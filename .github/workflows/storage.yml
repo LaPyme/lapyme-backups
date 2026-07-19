@@ -1,0 +1,90 @@
+name: Storage Backup
+
+on:
+  schedule:
+    # Run after the daily database backup.
+    - cron: "30 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-backup
+  cancel-in-progress: false
+
+env:
+  R2_STORAGE_PREFIX: storage/v1
+  STORAGE_BUCKETS: documents,imports,public_assets
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production-backups
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate and mask backup configuration
+        env:
+          SUPABASE_STORAGE_ENDPOINT: ${{ secrets.SUPABASE_STORAGE_ENDPOINT }}
+          SUPABASE_STORAGE_REGION: ${{ secrets.SUPABASE_STORAGE_REGION }}
+          SUPABASE_STORAGE_ACCESS_KEY_ID: ${{ secrets.SUPABASE_STORAGE_ACCESS_KEY_ID }}
+          SUPABASE_STORAGE_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_STORAGE_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          for var in \
+            SUPABASE_STORAGE_ENDPOINT \
+            SUPABASE_STORAGE_REGION \
+            SUPABASE_STORAGE_ACCESS_KEY_ID \
+            SUPABASE_STORAGE_SECRET_ACCESS_KEY \
+            R2_ACCESS_KEY_ID \
+            R2_SECRET_ACCESS_KEY \
+            R2_ENDPOINT \
+            R2_BUCKET
+          do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Missing required secret: $var"
+              exit 1
+            fi
+          done
+
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+
+          for variable in ("SUPABASE_STORAGE_ENDPOINT", "R2_ENDPOINT"):
+              parsed = urlsplit(os.environ[variable])
+              if parsed.hostname:
+                  print(f"::add-mask::{parsed.hostname}")
+          PY
+
+      - name: Install checksum-pinned rclone
+        run: bash scripts/install-rclone.sh
+
+      - name: Back up Storage objects to R2
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          RCLONE_CONFIG_SUPABASE_TYPE: s3
+          RCLONE_CONFIG_SUPABASE_PROVIDER: Other
+          RCLONE_CONFIG_SUPABASE_ACCESS_KEY_ID: ${{ secrets.SUPABASE_STORAGE_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_SUPABASE_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_STORAGE_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_SUPABASE_ENDPOINT: ${{ secrets.SUPABASE_STORAGE_ENDPOINT }}
+          RCLONE_CONFIG_SUPABASE_REGION: ${{ secrets.SUPABASE_STORAGE_REGION }}
+          RCLONE_CONFIG_SUPABASE_FORCE_PATH_STYLE: "true"
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_FORCE_PATH_STYLE: "true"
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+        run: python3 scripts/backup-storage.py

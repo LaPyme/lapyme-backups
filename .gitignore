@@ -1,1 +1,10 @@
 .env
+.env.*
+__pycache__/
+*.py[cod]
+
+# Production backup material must never be committed to this public repository.
+backup_*.dump
+backup_*.dump.sha256
+storage-manifest_*.json.gz
+rclone.conf

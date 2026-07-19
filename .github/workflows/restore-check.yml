@@ -1,0 +1,197 @@
+name: Database Restore Check
+
+on:
+  schedule:
+    # Exercise a real restore monthly, after the first monthly archive exists.
+    - cron: "0 9 8 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-restore-check
+  cancel-in-progress: false
+
+env:
+  DAILY_BACKUP_PREFIX: db/daily
+  # Match the production Supabase Postgres build and pin its manifest digest.
+  RESTORE_IMAGE: supabase/postgres:17.4.1.043@sha256:3ef8870ab7f49fd9e67e4c1334fb4fec580b3c72ae7dbf3c3a19126ffaf2b033
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production-backups
+
+    steps:
+      - name: Validate and mask R2 configuration
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          for var in \
+            AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY \
+            R2_ENDPOINT \
+            R2_BUCKET
+          do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Missing required secret: $var"
+              exit 1
+            fi
+          done
+
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+
+          parsed = urlsplit(os.environ["R2_ENDPOINT"])
+          if parsed.hostname:
+              print(f"::add-mask::{parsed.hostname}")
+          PY
+
+      - name: Download and verify the newest daily backup
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t dump_keys < <(
+            aws s3 ls "s3://${R2_BUCKET}/${DAILY_BACKUP_PREFIX}/" \
+              --endpoint-url "$R2_ENDPOINT" |
+              awk '$4 ~ /^backup_[0-9]{8}T[0-9]{6}Z\.dump$/ {print $4}' |
+              sort
+          )
+          if [ "${#dump_keys[@]}" -eq 0 ]; then
+            echo "::error::No daily database backup is available for restore testing."
+            exit 1
+          fi
+
+          newest_index=$((${#dump_keys[@]} - 1))
+          backup_key="${dump_keys[$newest_index]}"
+          backup_path="${RUNNER_TEMP}/backup.dump"
+          checksum_path="${RUNNER_TEMP}/backup.dump.sha256"
+
+          aws s3 cp \
+            "s3://${R2_BUCKET}/${DAILY_BACKUP_PREFIX}/${backup_key}" \
+            "$backup_path" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --only-show-errors
+          aws s3 cp \
+            "s3://${R2_BUCKET}/${DAILY_BACKUP_PREFIX}/${backup_key}.sha256" \
+            "$checksum_path" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --only-show-errors
+
+          expected_checksum="$(awk 'NR == 1 {print $1}' "$checksum_path")"
+          actual_checksum="$(sha256sum "$backup_path" | awk '{print $1}')"
+          if [[ ! "$expected_checksum" =~ ^[0-9a-f]{64}$ ]] || \
+            [ "$expected_checksum" != "$actual_checksum" ]
+          then
+            echo "::error::Downloaded database backup failed checksum validation."
+            exit 1
+          fi
+
+          echo "RESTORE_BACKUP_PATH=$backup_path" >> "$GITHUB_ENV"
+          echo "Database backup checksum verified."
+
+      - name: Restore into disposable Supabase Postgres
+        run: |
+          set -euo pipefail
+
+          container_name="lapyme-restore-check"
+          restore_password="restore-check-only"
+          error_log="${RUNNER_TEMP}/pg-restore.stderr"
+
+          docker run \
+            --detach \
+            --name "$container_name" \
+            --env POSTGRES_PASSWORD="$restore_password" \
+            --env POSTGRES_DB=postgres \
+            "$RESTORE_IMAGE" >/dev/null
+
+          ready=false
+          for _ in $(seq 1 90); do
+            if docker exec \
+              --env PGPASSWORD="$restore_password" \
+              "$container_name" \
+              pg_isready \
+                --host 127.0.0.1 \
+                --username supabase_admin \
+                --dbname postgres >/dev/null 2>&1
+            then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != true ]; then
+            echo "::error::Disposable restore database did not become ready."
+            exit 1
+          fi
+
+          if ! docker exec \
+            --env PGPASSWORD="$restore_password" \
+            "$container_name" \
+            createdb \
+              --host 127.0.0.1 \
+              --username supabase_admin \
+              --owner supabase_admin \
+              --template template0 \
+              restore_check >/dev/null 2>"${RUNNER_TEMP}/createdb.stderr"
+          then
+            echo "::error::Could not create the clean restore target database."
+            exit 1
+          fi
+
+          docker cp "$RESTORE_BACKUP_PATH" "${container_name}:/tmp/backup.dump"
+          if ! docker exec \
+            --env PGPASSWORD="$restore_password" \
+            "$container_name" \
+            pg_restore \
+              --host 127.0.0.1 \
+              --username supabase_admin \
+              --dbname restore_check \
+              --no-owner \
+              --no-privileges \
+              --exit-on-error \
+              /tmp/backup.dump >"${RUNNER_TEMP}/pg-restore.stdout" 2>"$error_log"
+          then
+            echo "::error::Database restore failed; details were suppressed to keep the public workflow log private."
+            exit 1
+          fi
+
+          if ! docker exec \
+            --env PGPASSWORD="$restore_password" \
+            "$container_name" \
+            psql \
+              --host 127.0.0.1 \
+              --username supabase_admin \
+              --dbname restore_check \
+              --set ON_ERROR_STOP=1 \
+              --command "
+                DO \$\$
+                BEGIN
+                  IF to_regclass('public.organizations') IS NULL THEN
+                    RAISE EXCEPTION 'required application schema is missing';
+                  END IF;
+                  IF NOT EXISTS (SELECT 1 FROM public.organizations) THEN
+                    RAISE EXCEPTION 'restored application database is unexpectedly empty';
+                  END IF;
+                END
+                \$\$;
+              " >/dev/null 2>"${RUNNER_TEMP}/restore-validation.stderr"
+          then
+            echo "::error::Restored database failed structural validation; details were suppressed."
+            exit 1
+          fi
+
+          echo "Full database restore and structural validation succeeded."
