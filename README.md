@@ -87,17 +87,19 @@ Storage paths can contain organization identifiers and original filenames. The
 incremental backup therefore does not reproduce source paths in R2 object keys.
 For every new or changed source object it:
 
-1. downloads the object without logging its path;
+1. downloads the object in a bounded batch without logging its path;
 2. hashes both its source path and contents;
 3. uploads the bytes under a content-addressed R2 key containing hashes only;
-4. writes the original path-to-object mapping into a private, compressed,
-   SHA-256-addressed manifest in R2.
+4. checkpoints the original path-to-object mapping in a private, compressed,
+   SHA-256-addressed manifest in R2 after every completed batch.
 
-Unchanged content is not transferred again. Source deletions and overwrites do
-not destroy earlier R2 content. Routine workflow output contains success or
-failure status only; archive sizes, object counts, customer paths, and byte
-totals remain private. Command failures are represented by a redacted reference
-rather than raw tool output.
+The checkpoints are append-only and make interrupted or timed-out runs resume
+from their latest completed batch. Unchanged content is not transferred again.
+Source deletions and overwrites do not destroy earlier R2 content. Routine
+workflow output contains bucket-level checkpoint percentages and final status
+only; archive sizes, object counts, customer paths, and byte totals remain
+private. Command failures are represented by a redacted reference rather than
+raw tool output.
 
 The Storage archive is append-only and does not currently garbage-collect old
 content versions. Add a reviewed retention/erasure process before treating it

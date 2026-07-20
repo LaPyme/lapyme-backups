@@ -42,6 +42,9 @@ class Settings:
     destination_prefix: str
     buckets: tuple[str, ...]
     temp_dir: Path
+    batch_size: int
+    transfers: int
+    checkers: int
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -67,6 +70,16 @@ class Settings:
         if not prefix or not re.fullmatch(r"[a-zA-Z0-9/_-]+", prefix):
             raise BackupError("R2 storage prefix is invalid")
 
+        def bounded_integer(name: str, default: int, maximum: int) -> int:
+            raw = os.environ.get(name, str(default))
+            try:
+                value = int(raw)
+            except ValueError as error:
+                raise BackupError("Storage concurrency configuration is invalid") from error
+            if value < 1 or value > maximum:
+                raise BackupError("Storage concurrency configuration is invalid")
+            return value
+
         return cls(
             rclone=os.environ.get("RCLONE_BIN", "rclone"),
             source_remote=os.environ.get("SOURCE_REMOTE", "supabase"),
@@ -75,6 +88,9 @@ class Settings:
             destination_prefix=prefix,
             buckets=buckets,
             temp_dir=Path(required["RUNNER_TEMP"]),
+            batch_size=bounded_integer("STORAGE_BATCH_SIZE", 2000, 10_000),
+            transfers=bounded_integer("STORAGE_TRANSFERS", 32, 128),
+            checkers=bounded_integer("STORAGE_CHECKERS", 64, 256),
         )
 
     def source(self, bucket: str, path: str = "") -> str:
@@ -197,16 +213,19 @@ def load_latest_manifest(settings: Settings) -> dict[str, Any] | None:
         allow_missing=True,
     )
     listed = safe_json_list(raw) if raw else []
-    candidates = sorted(
-        (
-            item["ModTime"],
-            item["Name"],
-        )
-        for item in listed
-        if isinstance(item.get("Name"), str)
-        and isinstance(item.get("ModTime"), str)
-        and MANIFEST_PATTERN.fullmatch(item["Name"])
-    )
+    candidates: list[tuple[str, str]] = []
+    for item in listed:
+        name = item.get("Name")
+        if not isinstance(name, str):
+            continue
+        match = MANIFEST_PATTERN.fullmatch(name)
+        if match is None:
+            continue
+        timestamp = match.group(1).removesuffix("Z")
+        base = timestamp[:15]
+        fraction = timestamp[15:].ljust(6, "0")
+        candidates.append((f"{base}{fraction}", name))
+    candidates.sort()
     if not candidates:
         return None
 
@@ -266,8 +285,15 @@ def previous_bucket_map(
         if (
             not is_safe_source_path(path)
             or not is_valid_backup_key(settings, bucket, key)
+            or not isinstance(item.get("size"), int)
+            or item["size"] < 0
+            or not isinstance(item.get("mod_time"), str)
+            or not isinstance(item.get("source_md5", ""), str)
+            or not isinstance(item.get("mime_type", ""), str)
         ):
             raise BackupError("Invalid storage manifest entry")
+        if path in result:
+            raise BackupError("Duplicate storage manifest entry")
         result[path] = item
     return result
 
@@ -316,9 +342,9 @@ def backup_changed_objects(
                 "--files-from-raw",
                 str(files_from),
                 "--transfers",
-                "8",
+                str(settings.transfers),
                 "--checkers",
-                "16",
+                str(settings.checkers),
                 settings.source(bucket),
                 str(source_root),
             ],
@@ -356,10 +382,11 @@ def backup_changed_objects(
                     "copy",
                     "--quiet",
                     "--immutable",
+                    "--no-traverse",
                     "--transfers",
-                    "8",
+                    str(settings.transfers),
                     "--checkers",
-                    "16",
+                    str(settings.checkers),
                     str(staging_root),
                     settings.destination(f"{settings.destination_prefix}/objects"),
                 ],
@@ -385,16 +412,17 @@ def create_manifest_entry(source: dict[str, Any], backup_key: str) -> dict[str, 
 
 
 def upload_manifest(settings: Settings, manifest: dict[str, Any]) -> str:
+    written_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    payload = {**manifest, "written_at": written_at}
     serialized = json.dumps(
-        manifest,
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
     compressed = gzip.compress(serialized, compresslevel=9, mtime=0)
     digest = hashlib.sha256(compressed).hexdigest()
-    timestamp = manifest["created_at"].replace("-", "").replace(":", "")
-    name = f"storage-manifest_{timestamp}_{digest}.json.gz"
+    name = f"storage-manifest_{written_at}_{digest}.json.gz"
 
     with tempfile.NamedTemporaryFile(
         prefix="storage-manifest-",
@@ -409,7 +437,14 @@ def upload_manifest(settings: Settings, manifest: dict[str, Any]) -> str:
         remote_path = f"{settings.destination_prefix}/manifests/{name}"
         run_rclone(
             settings,
-            ["copyto", "--quiet", "--no-traverse", str(local_path), settings.destination(remote_path)],
+            [
+                "copyto",
+                "--quiet",
+                "--immutable",
+                "--no-traverse",
+                str(local_path),
+                settings.destination(remote_path),
+            ],
         )
     finally:
         local_path.unlink(missing_ok=True)
@@ -419,10 +454,24 @@ def upload_manifest(settings: Settings, manifest: dict[str, Any]) -> str:
 def execute(settings: Settings) -> dict[str, dict[str, int]]:
     previous_manifest = load_latest_manifest(settings)
     destination_objects = list_destination_objects(settings)
+    previous_by_bucket = {
+        bucket: previous_bucket_map(settings, previous_manifest, bucket)
+        for bucket in settings.buckets
+    }
     manifest: dict[str, Any] = {
         "version": MANIFEST_VERSION,
         "created_at": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
-        "buckets": {},
+        "complete": False,
+        "buckets": {
+            bucket: {
+                "objects": sorted(
+                    (dict(item) for item in previous.values()),
+                    key=lambda item: item["path"],
+                )
+            }
+            for bucket, previous in previous_by_bucket.items()
+            if previous
+        },
     }
     summaries: dict[str, dict[str, int]] = {}
 
@@ -432,7 +481,7 @@ def execute(settings: Settings) -> dict[str, dict[str, int]]:
             ["lsjson", "--recursive", "--files-only", "--hash", settings.source(bucket)],
         )
         source_objects = safe_json_list(raw)
-        previous = previous_bucket_map(settings, previous_manifest, bucket)
+        previous = previous_by_bucket[bucket]
         current_paths: set[str] = set()
         entries: list[dict[str, Any]] = []
         changed_sources: list[dict[str, Any]] = []
@@ -460,21 +509,46 @@ def execute(settings: Settings) -> dict[str, dict[str, int]]:
             else:
                 changed_sources.append(source)
 
-        changed_results = backup_changed_objects(
-            settings,
-            bucket,
-            changed_sources,
-            destination_objects,
-        )
-        for source in changed_sources:
-            source_path = source["Path"]
-            backup_key, copied_bytes = changed_results[source_path]
-            uploaded += 1 if copied_bytes else 0
-            uploaded_bytes += copied_bytes
-            entries.append(create_manifest_entry(source, backup_key))
-
         entries.sort(key=lambda item: item["path"])
         manifest["buckets"][bucket] = {"objects": entries}
+
+        batches = [
+            changed_sources[index : index + settings.batch_size]
+            for index in range(0, len(changed_sources), settings.batch_size)
+        ]
+        for batch_index, batch in enumerate(batches, start=1):
+            changed_results = backup_changed_objects(
+                settings,
+                bucket,
+                batch,
+                destination_objects,
+            )
+            for source in batch:
+                source_path = source["Path"]
+                result = changed_results.get(source_path)
+                if result is None:
+                    raise BackupError("Changed object backup result is incomplete")
+                backup_key, copied_bytes = result
+                uploaded += 1 if copied_bytes else 0
+                uploaded_bytes += copied_bytes
+                entries.append(create_manifest_entry(source, backup_key))
+
+            entries.sort(key=lambda item: item["path"])
+            manifest["buckets"][bucket] = {"objects": entries}
+            upload_manifest(settings, manifest)
+            percentage = round(batch_index * 100 / len(batches))
+            print(
+                f"Storage backup checkpoint committed: {bucket} {percentage}%.",
+                flush=True,
+            )
+
+        if not batches:
+            upload_manifest(settings, manifest)
+            print(
+                f"Storage backup checkpoint committed: {bucket} 100%.",
+                flush=True,
+            )
+
         summaries[bucket] = {
             "scanned": len(entries),
             "reused": reused,
@@ -483,6 +557,7 @@ def execute(settings: Settings) -> dict[str, dict[str, int]]:
             "deleted_since_previous": len(set(previous) - current_paths),
         }
 
+    manifest["complete"] = True
     upload_manifest(settings, manifest)
     return summaries
 
