@@ -40,6 +40,10 @@ cleanup.
   into the matching Supabase Postgres image, and checks that the application
   schema is present and non-empty. A failed restore lists every failing schema
   object; row values are never printed.
+  Roles are cluster-wide and not in the dump, so before restoring it creates,
+  without login rights, every role the dump's policies name that the image
+  lacks (today `support_storage_readonly`). A real restore needs the same roles
+  created first.
 - `.github/workflows/ci.yml` runs public, secret-free tests for pull requests and
   changes to `main`.
 

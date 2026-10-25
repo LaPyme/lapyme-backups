@@ -163,6 +163,48 @@ jobs:
           fi
 
           docker cp "$RESTORE_BACKUP_PATH" "${container_name}:/tmp/backup.dump"
+
+          # Roles are cluster-wide, so pg_dump never includes them. Policies
+          # granted to production-only roles (e.g. support_storage_readonly)
+          # fail to restore unless those roles exist first, exactly as they
+          # would in a real disaster restore. Create each role the dump's
+          # policies name that this image lacks, without login rights.
+          policy_sql="${RUNNER_TEMP}/post-data.sql"
+          docker exec "$container_name" \
+            pg_restore --section=post-data --file=- /tmp/backup.dump >"$policy_sql"
+          mapfile -t policy_roles < <(python3 - "$policy_sql" <<'PY'
+          import re
+          import sys
+
+          roles = set()
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              if not line.startswith("CREATE POLICY "):
+                  continue
+              match = re.search(r" TO ((?:\w+)(?:, \w+)*)(?: USING| WITH CHECK|;)", line)
+              if match:
+                  roles.update(match.group(1).split(", "))
+          roles.discard("public")
+          print("\n".join(sorted(role for role in roles if re.fullmatch(r"[a-z_][a-z0-9_]*", role))))
+          PY
+          )
+          for role in "${policy_roles[@]}"; do
+            [ -n "$role" ] || continue
+            docker exec -i \
+              --env PGPASSWORD="$restore_password" \
+              "$container_name" \
+              psql \
+                --host 127.0.0.1 \
+                --username supabase_admin \
+                --dbname postgres \
+                --set ON_ERROR_STOP=1 \
+                --set role="$role" \
+                --quiet >/dev/null <<'SQL'
+          SELECT format('CREATE ROLE %I NOLOGIN', :'role')
+          WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role') \gexec
+          SQL
+          done
+          echo "Policy roles checked: ${policy_roles[*]:-none}."
+
           if ! docker exec \
             --env PGPASSWORD="$restore_password" \
             "$container_name" \
