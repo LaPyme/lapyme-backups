@@ -365,6 +365,53 @@ class BackupStorageTests(unittest.TestCase):
         self.assertIn("storage-manifest_20260720T120000000001Z_", first_arguments[-1])
         self.assertIn("storage-manifest_20260720T120000000002Z_", second_arguments[-1])
 
+    def test_source_inventory_avoids_per_object_requests(self) -> None:
+        config = settings()
+        key = backup_key("documents", "ab")
+        previous_manifest = {
+            "version": 1,
+            "buckets": {
+                "documents": {
+                    "objects": [manifest_item("org/one/invoice.pdf", "same", key)]
+                }
+            },
+        }
+        listed = source_item("org/one/invoice.pdf", "same")
+        del listed["MimeType"]
+        uploaded_manifest: dict[str, object] = {}
+
+        def capture_manifest(
+            _settings: backup_storage.Settings, manifest: dict[str, object]
+        ) -> str:
+            uploaded_manifest.update(manifest)
+            return "digest"
+
+        with (
+            mock.patch.object(
+                backup_storage, "load_latest_manifest", return_value=previous_manifest
+            ),
+            mock.patch.object(
+                backup_storage, "list_destination_objects", return_value={key}
+            ),
+            mock.patch.object(
+                backup_storage,
+                "run_rclone",
+                return_value=json.dumps([listed]).encode("utf-8"),
+            ) as run,
+            mock.patch.object(
+                backup_storage, "upload_manifest", side_effect=capture_manifest
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            backup_storage.execute(config)
+
+        listing_arguments = run.call_args_list[0].args[1]
+        self.assertEqual(listing_arguments[0], "lsjson")
+        for flag in ("--fast-list", "--no-mimetype", "--use-server-modtime"):
+            self.assertIn(flag, listing_arguments)
+        entries = uploaded_manifest["buckets"]["documents"]["objects"]
+        self.assertEqual(entries[0]["mime_type"], "application/pdf")
+
     def test_public_error_output_never_contains_customer_path(self) -> None:
         sensitive_path = "org/customer-name/private-import.xlsx"
         stderr = io.StringIO()

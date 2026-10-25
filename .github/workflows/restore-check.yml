@@ -77,6 +77,16 @@ jobs:
 
           newest_index=$((${#dump_keys[@]} - 1))
           backup_key="${dump_keys[$newest_index]}"
+
+          # A restorable but stale dump still means the daily backup stopped.
+          backup_stamp="${backup_key#backup_}"
+          backup_stamp="${backup_stamp%Z.dump}"
+          backup_epoch="$(date -u -d "${backup_stamp:0:8} ${backup_stamp:9:2}:${backup_stamp:11:2}:${backup_stamp:13:2}" +%s)"
+          backup_age_hours=$(( ($(date -u +%s) - backup_epoch) / 3600 ))
+          if [ "$backup_age_hours" -gt 36 ]; then
+            echo "::error::The newest daily database backup is ${backup_age_hours} hours old."
+            exit 1
+          fi
           backup_path="${RUNNER_TEMP}/backup.dump"
           checksum_path="${RUNNER_TEMP}/backup.dump.sha256"
 
@@ -153,6 +163,48 @@ jobs:
           fi
 
           docker cp "$RESTORE_BACKUP_PATH" "${container_name}:/tmp/backup.dump"
+
+          # Roles are cluster-wide, so pg_dump never includes them. Policies
+          # granted to production-only roles (e.g. support_storage_readonly)
+          # fail to restore unless those roles exist first, exactly as they
+          # would in a real disaster restore. Create each role the dump's
+          # policies name that this image lacks, without login rights.
+          policy_sql="${RUNNER_TEMP}/post-data.sql"
+          docker exec "$container_name" \
+            pg_restore --section=post-data --file=- /tmp/backup.dump >"$policy_sql"
+          mapfile -t policy_roles < <(python3 - "$policy_sql" <<'PY'
+          import re
+          import sys
+
+          roles = set()
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              if not line.startswith("CREATE POLICY "):
+                  continue
+              match = re.search(r" TO ((?:\w+)(?:, \w+)*)(?: USING| WITH CHECK|;)", line)
+              if match:
+                  roles.update(match.group(1).split(", "))
+          roles.discard("public")
+          print("\n".join(sorted(role for role in roles if re.fullmatch(r"[a-z_][a-z0-9_]*", role))))
+          PY
+          )
+          for role in "${policy_roles[@]}"; do
+            [ -n "$role" ] || continue
+            docker exec -i \
+              --env PGPASSWORD="$restore_password" \
+              "$container_name" \
+              psql \
+                --host 127.0.0.1 \
+                --username supabase_admin \
+                --dbname postgres \
+                --set ON_ERROR_STOP=1 \
+                --set role="$role" \
+                --quiet >/dev/null <<'SQL'
+          SELECT format('CREATE ROLE %I NOLOGIN', :'role')
+          WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role') \gexec
+          SQL
+          done
+          echo "Policy roles checked: ${policy_roles[*]:-none}."
+
           if ! docker exec \
             --env PGPASSWORD="$restore_password" \
             "$container_name" \
@@ -162,10 +214,37 @@ jobs:
               --dbname restore_check \
               --no-owner \
               --no-privileges \
-              --exit-on-error \
               /tmp/backup.dump >"${RUNNER_TEMP}/pg-restore.stdout" 2>"$error_log"
           then
-            echo "::error::Database restore failed; details were suppressed to keep the public workflow log private."
+            # pg_restore keeps going past errors so one run reports every
+            # failing object, and still exits non-zero if any occurred. The
+            # summary names schema objects only: DETAIL, CONTEXT and SQL lines
+            # can carry row values, and table-data errors are reported by
+            # their TOC entry alone.
+            python3 - "$error_log" <<'PY'
+          import re
+          import sys
+
+          entry = None
+          data_entry = False
+          reported = 0
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              line = line.rstrip("\n")
+              toc = re.match(r"pg_restore: from TOC entry \d+; \d+ \d+ (.*)$", line)
+              if toc:
+                  entry = toc.group(1)
+                  data_entry = entry.startswith(("TABLE DATA", "SEQUENCE SET", "BLOB"))
+                  continue
+              if line.startswith("pg_restore: warning: errors ignored on restore"):
+                  print(line.removeprefix("pg_restore: warning: "))
+                  continue
+              if not line.startswith("pg_restore: error:") or reported >= 40:
+                  continue
+              reported += 1
+              message = "" if data_entry else line.split("ERROR:", 1)[-1].strip()[:240]
+              print(f"::error::Restore failed at {entry or 'unknown entry'}: {message}")
+          PY
+            echo "::error::Database restore reported errors; row values were suppressed to keep the public workflow log private."
             exit 1
           fi
 
