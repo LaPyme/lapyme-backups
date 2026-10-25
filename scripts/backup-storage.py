@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,12 @@ MANIFEST_VERSION = 1
 MANIFEST_PATTERN = re.compile(
     r"^storage-manifest_(\d{8}T\d{6}(?:\d{6})?Z)_([0-9a-f]{64})\.json\.gz$"
 )
+
+# S3 object listings carry size, ETag and LastModified but not rclone's mtime
+# metadata or the content type. Without these flags rclone issues one HEAD
+# request per object to read them, which made the documents inventory alone
+# exceed the job timeout.
+SOURCE_LISTING_FLAGS = ("--fast-list", "--no-mimetype", "--use-server-modtime")
 
 
 class BackupError(RuntimeError):
@@ -195,7 +202,7 @@ def list_destination_objects(settings: Settings) -> set[str]:
     root = f"{settings.destination_prefix}/objects"
     raw = run_rclone(
         settings,
-        ["lsf", "--recursive", "--files-only", settings.destination(root)],
+        ["lsf", "--recursive", "--files-only", "--fast-list", settings.destination(root)],
         allow_missing=True,
     )
     return {
@@ -339,6 +346,7 @@ def backup_changed_objects(
             [
                 "copy",
                 "--quiet",
+                "--use-server-modtime",
                 "--files-from-raw",
                 str(files_from),
                 "--transfers",
@@ -397,10 +405,17 @@ def backup_changed_objects(
         shutil.rmtree(work_root, ignore_errors=True)
 
 
-def create_manifest_entry(source: dict[str, Any], backup_key: str) -> dict[str, Any]:
+def create_manifest_entry(
+    source: dict[str, Any],
+    backup_key: str,
+    prior: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     hashes = source.get("Hashes")
     md5 = hashes.get("MD5", "") if isinstance(hashes, dict) else ""
     mime_type = source.get("MimeType")
+    if not isinstance(mime_type, str) or not mime_type:
+        # Listings skip the content type; keep the value an earlier run saw.
+        mime_type = prior.get("mime_type") if prior else ""
     return {
         "path": source["Path"],
         "size": source["Size"],
@@ -451,9 +466,20 @@ def upload_manifest(settings: Settings, manifest: dict[str, Any]) -> str:
     return digest
 
 
+def report_phase(label: str, started: float) -> None:
+    print(
+        f"Storage backup phase finished: {label} in {time.monotonic() - started:.0f}s.",
+        flush=True,
+    )
+
+
 def execute(settings: Settings) -> dict[str, dict[str, int]]:
+    started = time.monotonic()
     previous_manifest = load_latest_manifest(settings)
+    report_phase("previous manifest load", started)
+    started = time.monotonic()
     destination_objects = list_destination_objects(settings)
+    report_phase(f"backup inventory ({len(destination_objects)} objects)", started)
     previous_by_bucket = {
         bucket: previous_bucket_map(settings, previous_manifest, bucket)
         for bucket in settings.buckets
@@ -476,11 +502,20 @@ def execute(settings: Settings) -> dict[str, dict[str, int]]:
     summaries: dict[str, dict[str, int]] = {}
 
     for bucket in settings.buckets:
+        started = time.monotonic()
         raw = run_rclone(
             settings,
-            ["lsjson", "--recursive", "--files-only", "--hash", settings.source(bucket)],
+            [
+                "lsjson",
+                "--recursive",
+                "--files-only",
+                "--hash",
+                *SOURCE_LISTING_FLAGS,
+                settings.source(bucket),
+            ],
         )
         source_objects = safe_json_list(raw)
+        report_phase(f"{bucket} inventory ({len(source_objects)} objects)", started)
         previous = previous_by_bucket[bucket]
         current_paths: set[str] = set()
         entries: list[dict[str, Any]] = []
@@ -505,7 +540,7 @@ def execute(settings: Settings) -> dict[str, dict[str, int]]:
             ):
                 backup_key = prior_key
                 reused += 1
-                entries.append(create_manifest_entry(source, backup_key))
+                entries.append(create_manifest_entry(source, backup_key, prior))
             else:
                 changed_sources.append(source)
 
@@ -531,7 +566,9 @@ def execute(settings: Settings) -> dict[str, dict[str, int]]:
                 backup_key, copied_bytes = result
                 uploaded += 1 if copied_bytes else 0
                 uploaded_bytes += copied_bytes
-                entries.append(create_manifest_entry(source, backup_key))
+                entries.append(
+                    create_manifest_entry(source, backup_key, previous.get(source_path))
+                )
 
             entries.sort(key=lambda item: item["path"])
             manifest["buckets"][bucket] = {"objects": entries}

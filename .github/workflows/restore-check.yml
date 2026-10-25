@@ -77,6 +77,16 @@ jobs:
 
           newest_index=$((${#dump_keys[@]} - 1))
           backup_key="${dump_keys[$newest_index]}"
+
+          # A restorable but stale dump still means the daily backup stopped.
+          backup_stamp="${backup_key#backup_}"
+          backup_stamp="${backup_stamp%Z.dump}"
+          backup_epoch="$(date -u -d "${backup_stamp:0:8} ${backup_stamp:9:2}:${backup_stamp:11:2}:${backup_stamp:13:2}" +%s)"
+          backup_age_hours=$(( ($(date -u +%s) - backup_epoch) / 3600 ))
+          if [ "$backup_age_hours" -gt 36 ]; then
+            echo "::error::The newest daily database backup is ${backup_age_hours} hours old."
+            exit 1
+          fi
           backup_path="${RUNNER_TEMP}/backup.dump"
           checksum_path="${RUNNER_TEMP}/backup.dump.sha256"
 
@@ -162,10 +172,37 @@ jobs:
               --dbname restore_check \
               --no-owner \
               --no-privileges \
-              --exit-on-error \
               /tmp/backup.dump >"${RUNNER_TEMP}/pg-restore.stdout" 2>"$error_log"
           then
-            echo "::error::Database restore failed; details were suppressed to keep the public workflow log private."
+            # pg_restore keeps going past errors so one run reports every
+            # failing object, and still exits non-zero if any occurred. The
+            # summary names schema objects only: DETAIL, CONTEXT and SQL lines
+            # can carry row values, and table-data errors are reported by
+            # their TOC entry alone.
+            python3 - "$error_log" <<'PY'
+          import re
+          import sys
+
+          entry = None
+          data_entry = False
+          reported = 0
+          for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              line = line.rstrip("\n")
+              toc = re.match(r"pg_restore: from TOC entry \d+; \d+ \d+ (.*)$", line)
+              if toc:
+                  entry = toc.group(1)
+                  data_entry = entry.startswith(("TABLE DATA", "SEQUENCE SET", "BLOB"))
+                  continue
+              if line.startswith("pg_restore: warning: errors ignored on restore"):
+                  print(line.removeprefix("pg_restore: warning: "))
+                  continue
+              if not line.startswith("pg_restore: error:") or reported >= 40:
+                  continue
+              reported += 1
+              message = "" if data_entry else line.split("ERROR:", 1)[-1].strip()[:240]
+              print(f"::error::Restore failed at {entry or 'unknown entry'}: {message}")
+          PY
+            echo "::error::Database restore reported errors; row values were suppressed to keep the public workflow log private."
             exit 1
           fi
 

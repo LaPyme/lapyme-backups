@@ -27,12 +27,19 @@ cleanup.
 
 - `.github/workflows/main.yml` creates the daily logical PostgreSQL dump,
   validates the custom archive, uploads it to R2, preserves the first successful
-  dump of each month, and applies count-based retention.
+  dump of each month, and applies count-based retention. Its `keepalive` job
+  re-enables all three scheduled workflows every day: GitHub disables schedules
+  in a public repository after 60 days without commits, which stopped every
+  backup between 2026-09-19 and 2026-10-24.
 - `.github/workflows/storage.yml` incrementally backs up the `documents`,
-  `imports`, and `public_assets` buckets.
-- `.github/workflows/restore-check.yml` downloads the latest daily dump, verifies
-  its SHA-256 checksum, restores it into the matching Supabase Postgres image,
-  and checks that the application schema is present and non-empty.
+  `imports`, and `public_assets` buckets. Source listings use the S3 listing's
+  LastModified and skip content types, so rclone does not send one HEAD request
+  per object.
+- `.github/workflows/restore-check.yml` fails when the newest daily dump is
+  older than 36 hours, downloads it, verifies its SHA-256 checksum, restores it
+  into the matching Supabase Postgres image, and checks that the application
+  schema is present and non-empty. A failed restore lists every failing schema
+  object; row values are never printed.
 - `.github/workflows/ci.yml` runs public, secret-free tests for pull requests and
   changes to `main`.
 

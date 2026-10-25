@@ -22,6 +22,29 @@ env:
   POSTGRES_IMAGE: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
 
 jobs:
+  keepalive:
+    # GitHub disables schedules in a public repository after 60 days without
+    # commits, which silently stopped every backup in September 2026. Each
+    # daily run re-enables all three schedules. This job holds no production
+    # secrets, so it alone gets write access to Actions.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+
+    steps:
+      - name: Keep backup schedules enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          for workflow in main.yml storage.yml restore-check.yml; do
+            gh api --method PUT \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/enable"
+          done
+          echo "Backup schedules are enabled."
+
   backup:
     runs-on: ubuntu-latest
     timeout-minutes: 90
